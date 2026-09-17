@@ -1,0 +1,59 @@
+# Model / quantization artifacts
+quant/output/
+quant/assembly_test/
+quant/runtime_test/
+quant/bootstrap_passthrough/
+quant/bootstrap_k2/
+quant/old-45-shard-build/
+
+# Large upstream/reference artifacts
+upstream-reference/
+upstream-sample/
+
+# Build artifacts
+.torch_extensions/
+build/
+dist/
+*.so
+*.o
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Hugging Face / caches
+.cache/
+**/.cache/
+
+# Model weights
+*.safetensors
+*.gguf
+*.bin
+*.pt
+*.pth
+*.ckpt
+
+# Secrets / local configuration
+.env
+.env.*
+*.pem
+*.key
+
+# Logs / temporary files
+*.log
+*.tmp
+*.bak
+*~
+
+# Development snapshots
+scripts/*.pre-tools
+scripts/*.native-tools-working
+scripts/*.before-network
+
+# Local reference repositories
+refs/mia-glm53/
+
+# Local reference repositories
+refs/mia-glm53/

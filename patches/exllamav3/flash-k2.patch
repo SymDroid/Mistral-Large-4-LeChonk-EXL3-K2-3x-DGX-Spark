@@ -1,0 +1,202 @@
+diff --git a/exllamav3/exllamav3_ext/bindings.cpp b/exllamav3/exllamav3_ext/bindings.cpp
+index 1594d70..df54a3c 100644
+--- a/exllamav3/exllamav3_ext/bindings.cpp
++++ b/exllamav3/exllamav3_ext/bindings.cpp
+@@ -156,14 +156,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
+     m.def("g_get_cc", &g_get_cc, "g_get_cc");
+     m.def("g_get_num_sms", &g_get_num_sms, "g_get_num_sms");
+     m.def("exl3_gemv_int8_max_k", &exl3_gemv_int8_max_k, "exl3_gemv_int8_max_k");
+-    m.def("exl3_moe_cpu_make_layer", &exl3_moe_cpu_make_layer, "exl3_moe_cpu_make_layer");
++#if defined(__x86_64__) || defined(_M_X64)
++#if defined(__x86_64__) || defined(_M_X64)
++m.def("exl3_moe_cpu_make_layer", &exl3_moe_cpu_make_layer, "exl3_moe_cpu_make_layer");
+     m.def("exl3_moe_cpu_free_layer", &exl3_moe_cpu_free_layer, "exl3_moe_cpu_free_layer");
+     m.def("exl3_moe_cpu_forward", &exl3_moe_cpu_forward, "exl3_moe_cpu_forward",
+           py::call_guard<py::gil_scoped_release>());
+     m.def("exl3_moe_cpu_has_avx2", &exl3_moe_cpu_has_avx2, "exl3_moe_cpu_has_avx2");
++#endif  // x86-only CPU MoE
+     m.def("exl3_moe_flag_write", &exl3_moe_flag_write, "exl3_moe_flag_write");
+     m.def("exl3_moe_flag_wait", &exl3_moe_flag_wait, "exl3_moe_flag_wait");
+-    m.def("moe_unswizzle_trellis", &moe_unswizzle_trellis, "moe_unswizzle_trellis");
++
++#if defined(__x86_64__) || defined(_M_X64)
+     m.def("exl3_moe_cpu_set_memops", &exl3_moe_cpu_set_memops, "exl3_moe_cpu_set_memops");
+     m.def("exl3_moe_cpu_set_prof", &exl3_moe_cpu_set_prof, "exl3_moe_cpu_set_prof");
+     m.def("exl3_moe_cpu_pool_stress", &exl3_moe_cpu_pool_stress, "exl3_moe_cpu_pool_stress");
+@@ -172,6 +176,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
+     m.def("exl3_moe_cpu_has_avx512_bw", &exl3_moe_cpu_has_avx512_bw, "exl3_moe_cpu_has_avx512_bw");
+     m.def("exl3_moe_cpu_has_avx512_vnni", &exl3_moe_cpu_has_avx512_vnni, "exl3_moe_cpu_has_avx512_vnni");
+     m.def("exl3_moe_cpu_has_avx512_vbmi", &exl3_moe_cpu_has_avx512_vbmi, "exl3_moe_cpu_has_avx512_vbmi");
++#endif  // x86-only CPU MoE
++#endif  // x86-only CPU MoE/offload
++
++    m.def("moe_unswizzle_trellis", &moe_unswizzle_trellis, "moe_unswizzle_trellis");
+     m.def("exl3_mgemm", &exl3_mgemm, "exl3_mgemm",
+           py::arg("A"), py::arg("B"), py::arg("C"), py::arg("suh"), py::arg("A_had"), py::arg("svh"),
+           py::arg("indices"), py::arg("weights"), py::arg("K"), py::arg("force_shape_idx"), py::arg("mcg"),
+diff --git a/exllamav3/exllamav3_ext/cpu/moe_handoff.cu b/exllamav3/exllamav3_ext/cpu/moe_handoff.cu
+index 2550b1d..d4f1206 100644
+--- a/exllamav3/exllamav3_ext/cpu/moe_handoff.cu
++++ b/exllamav3/exllamav3_ext/cpu/moe_handoff.cu
+@@ -150,7 +150,13 @@ namespace {
+ inline void cpu_pause_()
+ {
+ #ifdef __linux__
+-    __builtin_ia32_pause();
++    #if defined(__x86_64__) || defined(_M_X64)
++      __builtin_ia32_pause();
++#elif defined(__aarch64__) || defined(__arm64__)
++      asm volatile("yield");
++#else
++      asm volatile("");
++#endif
+ #else
+     _mm_pause();
+ #endif
+diff --git a/exllamav3/exllamav3_ext/parallel/all_reduce_cpu.cu b/exllamav3/exllamav3_ext/parallel/all_reduce_cpu.cu
+index 5b3688f..e0f5c37 100644
+--- a/exllamav3/exllamav3_ext/parallel/all_reduce_cpu.cu
++++ b/exllamav3/exllamav3_ext/parallel/all_reduce_cpu.cu
+@@ -110,7 +110,13 @@ void run_cpu_reduce_jobs
+             if (++spins < 65536)
+             {
+                 #ifdef __linux__
++                    #if defined(__x86_64__) || defined(_M_X64)
+                     __builtin_ia32_pause();
++#elif defined(__aarch64__) || defined(__arm64__)
++                    asm volatile("yield");
++#else
++                    asm volatile("");
++#endif
+                 #else
+                     _mm_pause();
+                 #endif
+diff --git a/exllamav3/ext.py b/exllamav3/ext.py
+index a6c6347..f33c531 100644
+--- a/exllamav3/ext.py
++++ b/exllamav3/ext.py
+@@ -141,6 +141,30 @@ else:
+         if file.endswith(('.c', '.cpp', '.cu'))
+     ]
+ 
++    # ARM64 / DGX Spark: exclude x86-only AVX2/AVX512 translation units
++    import platform
++    machine = platform.machine().lower()
++    if machine in ("aarch64", "arm64"):
++        sources = [
++            src for src in sources
++            if not any(src.endswith(x) for x in (
++                "avx2_target.cpp",
++                "avx512_target.cpp",
++                "all_reduce_cpu_avx2.cpp",
++                "all_reduce_cpu_avx512.cpp",
++                "cpu/moe_mul1.cpp",
++                "cpu/moe_handoff.cu",
++            ))
++        ]
++
++    print("[EXL3 ARM] machine:", machine)
++    print("[EXL3 ARM] source count:", len(sources))
++    print("[EXL3 ARM] moe_mul1:", [x for x in sources if "moe_mul1" in x])
++    print("[EXL3 ARM] moe_handoff:", [x for x in sources if "moe_handoff" in x])
++    print("[EXL3 ARM] all_reduce_cpu:", [
++        x for x in sources if x.endswith("parallel/all_reduce_cpu.cu")
++    ])
++
+     # Load extension
+ 
+     maybe_set_arch_list_env()
+diff --git a/exllamav3/modules/linear.py b/exllamav3/modules/linear.py
+index e3616aa..edf2a1d 100644
+--- a/exllamav3/modules/linear.py
++++ b/exllamav3/modules/linear.py
+@@ -400,9 +400,27 @@ class Linear(Module):
+             return stc.get_tensor(k, device, optional = True, **kwargs) if stc.has_tensor(k) else None
+         scale = None  # opt(".scale", self.device)
+         su = opt(".su", self.device, no_defer = True)
+-        suh = opt(".suh", self.device)
++        suh = opt(".suh", self.device, no_defer = True)
+         sv = opt(".sv", self.device, no_defer = True)
+-        svh = opt(".svh", self.device)
++        svh = opt(".svh", self.device, no_defer = True)
++
++        # FP16-backed Linear loads bake weight_scale into the weight tensor.
++        # EXL3 kernels bypass Linear.forward() in several BC/MoE paths, so the
++        # equivalent scale must be represented in the packed projection itself.
++        #
++        # svh is the multiplicative output scale applied after the EXL3
++        # reconstruction/Hadamard transform. Scaling it is therefore exactly
++        # equivalent to scaling the reconstructed weight/output, and is visible
++        # to LinearEXL3, BC_LinearEXL3 and the fused MoE kernels alike.
++        if self.weight_scale != 1.0:
++            if svh is None:
++                raise RuntimeError(
++                    f"EXL3 weight_scale={self.weight_scale} for {key}, "
++                    "but checkpoint stores packed .sv rather than .svh; "
++                    "packed-sv scaling is not implemented yet."
++                )
++            svh = (svh.float() * self.weight_scale).to(svh.dtype)
++
+         trellis = stc.get_tensor(key + ".trellis", self.device)
+         mcg = opt(".mcg", "cpu")
+         mul1 = opt(".mul1", "cpu")
+diff --git a/exllamav3/exllamav3_ext/arm64_cpu_features.cpp b/exllamav3/exllamav3_ext/arm64_cpu_features.cpp
+new file mode 100644
+index 0000000..6076df1
+--- /dev/null
++++ b/exllamav3/exllamav3_ext/arm64_cpu_features.cpp
+@@ -0,0 +1,13 @@
++#if defined(__aarch64__) || defined(__arm64__)
++
++bool is_avx2_supported()
++{
++    return false;
++}
++
++bool is_f16c_supported()
++{
++    return false;
++}
++
++#endif
+diff --git a/exllamav3/exllamav3_ext/parallel/all_reduce_cpu_arm.cpp b/exllamav3/exllamav3_ext/parallel/all_reduce_cpu_arm.cpp
+new file mode 100644
+index 0000000..3dc578d
+--- /dev/null
++++ b/exllamav3/exllamav3_ext/parallel/all_reduce_cpu_arm.cpp
+@@ -0,0 +1,35 @@
++#if defined(__aarch64__) || defined(__arm64__)
++
++#include <cstddef>
++#include <cstdint>
++#include <torch/extension.h>
++
++#include "context.cuh"
++
++void perform_cpu_reduce
++(
++    PGContext* ctx,
++    size_t data_size,
++    uint32_t device_mask,
++    uint32_t wire_dtype,
++    uint8_t* shbuf_ptr,
++    size_t shbuf_size
++)
++{
++    TORCH_CHECK(
++        false,
++        "ExLlamaV3 CPU all-reduce AVX backend is unavailable on ARM64"
++    );
++}
++
++#endif
++
++#if defined(__aarch64__) || defined(__arm64__)
++
++void enable_fast_fp()
++{
++    // x86 version configures FTZ/DAZ.
++    // No-op on ARM64.
++}
++
++#endif
