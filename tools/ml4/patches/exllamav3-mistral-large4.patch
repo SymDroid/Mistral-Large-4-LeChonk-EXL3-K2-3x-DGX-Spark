@@ -1,0 +1,603 @@
+diff --git a/exllamav3/architecture/mistral3.py b/exllamav3/architecture/mistral3.py
+index 1e251b7..2848239 100644
+--- a/exllamav3/architecture/mistral3.py
++++ b/exllamav3/architecture/mistral3.py
+@@ -38,8 +38,24 @@ class Mistral3Config(Config):
+         # Mistral-Small-4 shares the Mistral3ForConditionalGeneration wrapper (same Pixtral
+         # tower and projector) around an MLA + MoE text stack; dispatch on the text model_type
+         with open(os.path.join(directory, "config.json"), encoding = "utf8") as f:
+-            text_model_type = json.load(f).get("text_config", {}).get("model_type")
+-        if text_model_type == "mistral4":
++            raw_config = json.load(f)
++
++        text_model_type = raw_config.get(
++            "text_config", {}
++        ).get("model_type")
++
++        if text_model_type in (
++            "mistral4",
++            "mistral_large4_text",
++        ):
++            arch = raw_config.get("architectures", [None])[0]
++            assert arch in (
++                "Mistral3ForConditionalGeneration",
++                "MistralLarge4ForConditionalGeneration",
++            ), f"Unsupported Mistral4 architecture: {arch}"
++
++            self.arch_string = arch
++
+             from .mistral4 import mistral4_init_config
+             mistral4_init_config(self, directory, **kwargs)
+             self._read_vision_config()
+diff --git a/exllamav3/architecture/mistral4.py b/exllamav3/architecture/mistral4.py
+index cf52a75..bdf7e10 100644
+--- a/exllamav3/architecture/mistral4.py
++++ b/exllamav3/architecture/mistral4.py
+@@ -28,6 +28,10 @@ def mistral4_init_config(config, directory: str, **kwargs):
+         **kwargs
+     )
+ 
++    config.new_key_style = config.stc.has_tensor(
++        "model.language_model.embed_tokens.weight"
++    )
++
+     # Latent attention params
+     config.hidden_size = config.read_cfg(int, "text_config->hidden_size", no_default)
+     config.num_q_heads = config.read_cfg(int, "text_config->num_attention_heads", no_default)
+@@ -40,6 +44,19 @@ def mistral4_init_config(config, directory: str, **kwargs):
+     # Reported head dim, for allocation and logging; the cache stores the latent instead
+     config.head_dim = config.qk_head_dim
+ 
++    config.index_n_heads = config.read_cfg(
++        int, "text_config->index_n_heads", no_default)
++    config.index_head_dim = config.read_cfg(
++        int, "text_config->index_head_dim", no_default)
++    config.index_topk = config.read_cfg(
++        int, "text_config->index_topk", no_default)
++    config.indexer_types = config.read_cfg(
++        list, "text_config->indexer_types", no_default)
++    config.kv_source_layers = config.read_cfg(
++        list, "text_config->kv_source_layers", no_default)
++    config.no_rope_layers = config.read_cfg(
++        list, "text_config->no_rope_layers", no_default)
++
+     # MLP params
+     config.assert_cfg(str, "text_config->hidden_act", "silu", True)
+     config.intermediate_size = config.read_cfg(int, "text_config->intermediate_size", no_default)
+@@ -125,16 +142,39 @@ class Mistral4TextModel(Model):
+                     hidden_size = config.hidden_size,
+                     num_q_heads = config.num_q_heads,
+                     kv_lora_rank = config.kv_lora_rank,
+-                    qk_nope_head_dim = config.qk_nope_head_dim,
+-                    qk_rope_head_dim = config.qk_rope_head_dim,
++                    qk_nope_head_dim = (
++                        config.qk_nope_head_dim
++                        + (0 if config.no_rope_layers[idx]
++                           else config.qk_rope_head_dim)
++                    ),
++                    qk_rope_head_dim = (
++                        config.qk_rope_head_dim
++                        if config.no_rope_layers[idx]
++                        else 0
++                    ),
+                     v_head_dim = config.v_head_dim,
+-                    rope_settings = config.rope_settings,
++                    rope_settings = (
++                        config.rope_settings
++                        if config.no_rope_layers[idx]
++                        else None
++                    ),
+                     q_lora_rank = config.q_lora_rank,
+                     sm_scale = config.sm_scale,
+                     rms_norm_eps = config.rms_norm_eps,
+                     qmap = "block.attn",
+                     out_dtype = torch.float,
+                     select_hq_bits = 2,
++                    indexer_mode = config.indexer_types[idx],
++                    index_n_heads = config.index_n_heads,
++                    index_head_dim = config.index_head_dim,
++                    index_topk = config.index_topk,
++                    indexer_from_hidden = True,
++                    learned_ssmax = True,
++                    kv_source_layer = config.kv_source_layers[idx],
++                    store_shared_kv = any(
++                        src == idx
++                        for src in config.kv_source_layers[idx + 1:]
++                    ),
+                 ),
+                 mlp_norm = RMSNorm(
+                     config = config,
+diff --git a/exllamav3/modules/mla_attn.py b/exllamav3/modules/mla_attn.py
+index e432310..f0d3dc0 100644
+--- a/exllamav3/modules/mla_attn.py
++++ b/exllamav3/modules/mla_attn.py
+@@ -105,6 +105,10 @@ class MLAttention(Module):
+         index_kpool: int = 0,
+         index_kpool_tail: bool = True,
+         key_indexer: str = "indexer",
++        indexer_from_hidden: bool = False,
++        learned_ssmax: bool = False,
++        kv_source_layer: int | None = None,
++        store_shared_kv: bool = False,
+     ):
+         super().__init__(config, key, None)
+ 
+@@ -129,6 +133,19 @@ class MLAttention(Module):
+         self.key_indexer = key_indexer
+         self.norm_eps = rms_norm_eps
+ 
++        self.indexer_from_hidden = indexer_from_hidden
++        self.learned_ssmax = learned_ssmax
++        self.kv_source_layer = (
++            layer_idx if kv_source_layer is None else kv_source_layer
++        )
++        self.is_kv_shared_layer = self.kv_source_layer != layer_idx
++        self.store_shared_kv = store_shared_kv
++
++        self.ssmax_s = None
++        self.ssmax_b = None
++        self.idx_ssmax_s = None
++        self.idx_ssmax_b = None
++
+         # The softmax scale follows the *unabsorbed* head dim: absorption does not change the
+         # scores, only how they are computed. Architectures with YaRN mscale pass their own
+         self.sm_scale = sm_scale if sm_scale is not None else self.qk_head_dim ** -0.5
+@@ -173,16 +190,24 @@ class MLAttention(Module):
+ 
+         # Latent path. The output of this projection goes straight into the cache, so it is the
+         # one place where quantization error compounds over the whole context
+-        self.kv_a_proj_with_mqa = Linear(
+-            config, f"{key}.{key_kv_a}", hidden_size, kv_lora_rank + qk_rope_head_dim,
+-            qmap = qmap_in, out_dtype = torch.half, trim_padded_out = True,
+-            select_hq_bits = select_hq_bits, qbits_key = qbits_key,
+-        )
+-        self.kv_a_layernorm = RMSNorm(
+-            config, f"{key}.{key_kv_a_norm}", rms_norm_eps, out_dtype = torch.half,
+-        )
+-        self.register_submodule(self.kv_a_proj_with_mqa)
+-        self.register_submodule(self.kv_a_layernorm)
++        if not self.is_kv_shared_layer:
++            self.kv_a_proj_with_mqa = Linear(
++                config, f"{key}.{key_kv_a}",
++                hidden_size, kv_lora_rank + qk_rope_head_dim,
++                qmap = qmap_in, out_dtype = torch.half,
++                trim_padded_out = True,
++                select_hq_bits = select_hq_bits,
++                qbits_key = qbits_key,
++            )
++            self.kv_a_layernorm = RMSNorm(
++                config, f"{key}.{key_kv_a_norm}",
++                rms_norm_eps, out_dtype = torch.half,
++            )
++            self.register_submodule(self.kv_a_proj_with_mqa)
++            self.register_submodule(self.kv_a_layernorm)
++        else:
++            self.kv_a_proj_with_mqa = None
++            self.kv_a_layernorm = None
+ 
+         self.o_proj = Linear(
+             config, f"{key}.{key_o}", num_q_heads * v_head_dim, hidden_size,
+@@ -214,10 +239,29 @@ class MLAttention(Module):
+             index_head_dim * 2 if index_kpool else index_head_dim
+         )
+         if indexer_mode == "full":
+-            assert q_lora_rank is not None, "DSA indexer queries project from the q_a latent"
++            if indexer_from_hidden:
++                self.idx_q_input_norm = LayerNorm(
++                    config,
++                    f"{key}.{key_indexer}.q_input_norm",
++                    1e-6,
++                    out_dtype = torch.half,
++                )
++                idx_q_in = hidden_size
++                idx_qmap = qmap_in
++                self.register_submodule(self.idx_q_input_norm)
++            else:
++                assert q_lora_rank is not None, \
++                    "DSA indexer queries project from the q_a latent"
++                self.idx_q_input_norm = None
++                idx_q_in = q_lora_rank
++                idx_qmap = qmap + ".q_a" if qmap is not None else None
++
+             self.idx_wq_b = Linear(
+-                config, f"{key}.{key_indexer}.wq_b", q_lora_rank, index_n_heads * index_head_dim,
+-                qmap = qmap + ".q_a" if qmap is not None else None,
++                config,
++                f"{key}.{key_indexer}.wq_b",
++                idx_q_in,
++                index_n_heads * index_head_dim,
++                qmap = idx_qmap,
+                 out_dtype = torch.half, trim_padded_out = True,
+                 select_hq_bits = select_hq_bits, qbits_key = qbits_key,
+             )
+@@ -239,6 +283,7 @@ class MLAttention(Module):
+             self.register_submodule(self.idx_k_norm)
+             self.register_submodule(self.idx_weights)
+         else:
++            self.idx_q_input_norm = None
+             self.idx_wq_b = None
+             self.idx_wk = None
+             self.idx_k_norm = None
+@@ -278,12 +323,60 @@ class MLAttention(Module):
+         )
+ 
+ 
++    def _ml4_ssmax(
++        self,
++        s,
++        b,
++        bsz,
++        seqlen,
++        position,
++        positions,
++        position_ids,
++        device,
++    ):
++        if position_ids is not None:
++            pos = position_ids.view(
++                bsz, -1
++            )[:, :seqlen].float()
++        elif positions is not None:
++            pos = positions.view(
++                bsz, 1
++            ).float() + torch.arange(
++                seqlen,
++                device = device,
++                dtype = torch.float,
++            )
++        else:
++            pos = (
++                position
++                + torch.arange(
++                    seqlen,
++                    device = device,
++                    dtype = torch.float,
++                )
++            ).view(1, seqlen).expand(
++                bsz, seqlen
++            )
++
++        log_pos = torch.log(pos + 1.0).half()
++
++        return (
++            log_pos.unsqueeze(-1)
++            * s.view(1, 1, -1)
++            + b.view(1, 1, -1)
++        )
++
++
+     @override
+     def optimizer_targets(self):
+         q = (self.q_a_proj.optimizer_targets() if self.q_a_proj else []) + \
+             self.q_proj.optimizer_targets() + \
+             (self.idx_wq_b.optimizer_targets() if self.idx_wq_b else [])
+-        kv = self.kv_a_proj_with_mqa.optimizer_targets()
++        kv = (
++            self.kv_a_proj_with_mqa.optimizer_targets()
++            if self.kv_a_proj_with_mqa is not None
++            else []
++        )
+         o = self.o_proj.optimizer_targets()
+         return [[q, kv, o]]
+ 
+@@ -292,6 +385,38 @@ class MLAttention(Module):
+         for cl in self.cache_layers:
+             cl.alloc(device)
+ 
++        if self.learned_ssmax:
++            stc = self.config.stc
++
++            self.ssmax_s = stc.get_tensor(
++                f"{self.key}.ssmax_scaling.s",
++                device,
++                no_defer = True,
++                allow_bf16 = True,
++            ).half()
++
++            self.ssmax_b = stc.get_tensor(
++                f"{self.key}.ssmax_scaling.b",
++                device,
++                no_defer = True,
++                allow_bf16 = True,
++            ).half()
++
++            if self.indexer_mode == "full":
++                self.idx_ssmax_s = stc.get_tensor(
++                    f"{self.key}.{self.key_indexer}.ssmax_scaling.s",
++                    device,
++                    no_defer = True,
++                    allow_bf16 = True,
++                ).half()
++
++                self.idx_ssmax_b = stc.get_tensor(
++                    f"{self.key}.{self.key_indexer}.ssmax_scaling.b",
++                    device,
++                    no_defer = True,
++                    allow_bf16 = True,
++                ).half()
++
+         if self.index_kpool:
+             stc = self.config.stc
+             self.idx_kpool_ape = stc.get_tensor(
+@@ -303,10 +428,35 @@ class MLAttention(Module):
+ 
+         if self.rope_settings:
+             self.rope = RoPE(device, self.rope_settings)
++
++            # Mistral Large 4 LeRoPE:
++            # effective_inv_freq = inv_freq * exp(alpha)
++            if self.learned_ssmax:
++                alpha = self.config.stc.get_tensor(
++                    "lerope.alpha",
++                    device,
++                    no_defer = True,
++                    allow_bf16 = True,
++                ).float()
++
++                if alpha.shape != self.rope.inv_freq.shape:
++                    raise ValueError(
++                        "LeRoPE alpha shape mismatch: "
++                        f"{tuple(alpha.shape)} vs "
++                        f"{tuple(self.rope.inv_freq.shape)}"
++                    )
++
++                self.rope.inv_freq.mul_(alpha.exp())
++                del alpha
++
+             # The Llama-4 scale multiplies the FULL query post-rope (HF semantics, q only). Only
+             # the q_pe/k_pe slices pass through the rope kernel here, which would miss q_nope, so
+             # take the beta out of the kernel and scale the whole query in _attend instead
+-            self.l4_beta = self.rope.llama_4_scaling_beta
++            self.l4_beta = (
++                0.0
++                if self.learned_ssmax
++                else self.rope.llama_4_scaling_beta
++            )
+             self.l4_original = self.rope.llama_4_scaling_original
+             self.rope.llama_4_scaling_beta = 0.0
+ 
+@@ -364,6 +514,24 @@ class MLAttention(Module):
+                 self.idx_kpool_ape.contiguous()
+             t[f"{self.key}.{self.key_indexer}.index_kpool_compress_gate"] = \
+                 self.idx_kpool_gate.contiguous()
++
++        if self.learned_ssmax and self.ssmax_s is not None:
++            t[f"{self.key}.ssmax_scaling.s"] = \
++                self.ssmax_s.contiguous()
++            t[f"{self.key}.ssmax_scaling.b"] = \
++                self.ssmax_b.contiguous()
++
++            if (
++                self.indexer_mode == "full"
++                and self.idx_ssmax_s is not None
++            ):
++                t[
++                    f"{self.key}.{self.key_indexer}.ssmax_scaling.s"
++                ] = self.idx_ssmax_s.contiguous()
++                t[
++                    f"{self.key}.{self.key_indexer}.ssmax_scaling.b"
++                ] = self.idx_ssmax_b.contiguous()
++
+         return t
+ 
+ 
+@@ -462,8 +630,37 @@ class MLAttention(Module):
+         from ..ext import exllamav3_ext as ext
+ 
+         H_i, D_i = self.index_n_heads, self.index_head_dim
+-        q_idx = self.idx_wq_b.forward(q_resid, params).view(bsz, seqlen, H_i, D_i).contiguous()
+-        self._indexer_rope_(q_idx, position, positions, position_ids, inv_freq)
++
++        q_src = (
++            self.idx_q_input_norm.forward(
++                x, params, out_dtype = torch.half
++            )
++            if self.indexer_from_hidden
++            else q_resid
++        )
++
++        q_idx = self.idx_wq_b.forward(
++            q_src, params
++        ).view(
++            bsz, seqlen, H_i, D_i
++        ).contiguous()
++
++        if self.learned_ssmax:
++            scale = self._ml4_ssmax(
++                self.idx_ssmax_s,
++                self.idx_ssmax_b,
++                bsz,
++                seqlen,
++                position,
++                positions,
++                position_ids,
++                x.device,
++            )
++            q_idx *= scale.unsqueeze(-1)
++
++        self._indexer_rope_(
++            q_idx, position, positions, position_ids, inv_freq
++        )
+         # Raw head weights; the scoring kernel folds in the D_i**-0.5 and H_i**-0.5 scales and
+         # runs the relu-weighted reduction in fp32, matching the reference
+         w = self.idx_weights.forward(x, params)
+@@ -772,6 +969,20 @@ class MLAttention(Module):
+         _dbg_sync("attend-entry (upstream modules)", x.device)
+         q, q_resid = self.project_q(x, params, return_resid = True)
+         q = q.view(R, H, self.qk_head_dim)
++
++        if self.learned_ssmax:
++            scale = self._ml4_ssmax(
++                self.ssmax_s,
++                self.ssmax_b,
++                bsz,
++                seqlen,
++                position,
++                positions,
++                position_ids,
++                x.device,
++            )
++            q *= scale.reshape(R, H, 1)
++
+         if self.l4_beta:
+             # Whole query (nope + pe), before the split so the absorbed and MHA paths both
+             # inherit it; a per-token scalar commutes with the rotation
+@@ -780,17 +991,46 @@ class MLAttention(Module):
+         q_nope = q[:, :, :self.qk_nope_head_dim]
+         q_pe = q[:, :, self.qk_nope_head_dim:].reshape(bsz, seqlen, H, self.qk_rope_head_dim)
+ 
+-        # Latent K/V. The normalized latent is what gets cached, matching the reference order
+-        # (kv_a_layernorm is applied before kv_b_proj would be)
+-        ckv_kpe = self.kv_a_proj_with_mqa.forward(x, params)
+-        _dbg_sync("kv_a_proj", x.device)
+-        ckv = self.kv_a_layernorm.forward(
+-            ckv_kpe[..., :self.kv_lora_rank].contiguous(), params, out_dtype = torch.half
++        # Latent K/V. ML4 shared layers can read their source layer cache directly.
++        external_shared_kv = params.get(
++            "_ml4_external_shared_kv", False
+         )
+-        k_pe = ckv_kpe[..., self.kv_lora_rank:].reshape(bsz, seqlen, 1, self.qk_rope_head_dim).contiguous()
+-        _dbg_sync("kv_a_layernorm+slice", x.device)
++
++        if external_shared_kv:
++            ckv = None
++            k_pe = None
++        elif self.is_kv_shared_layer:
++            shared = params.get("_ml4_shared_kv_chunks", {})
++            if self.kv_source_layer not in shared:
++                raise RuntimeError(
++                    f"ML4 shared-KV layer {self.layer_idx} "
++                    f"missing source layer {self.kv_source_layer}"
++                )
++            ckv, k_pe = shared[self.kv_source_layer]
++        else:
++            ckv_kpe = self.kv_a_proj_with_mqa.forward(x, params)
++            _dbg_sync("kv_a_proj", x.device)
++            ckv = self.kv_a_layernorm.forward(
++                ckv_kpe[..., :self.kv_lora_rank].contiguous(),
++                params,
++                out_dtype = torch.half,
++            )
++            k_pe = ckv_kpe[
++                ..., self.kv_lora_rank:
++            ].reshape(
++                bsz, seqlen, 1, self.qk_rope_head_dim
++            ).contiguous()
++            _dbg_sync("kv_a_layernorm+slice", x.device)
++
++            if self.store_shared_kv:
++                shared = params.setdefault(
++                    "_ml4_shared_kv_chunks", {}
++                )
++                shared[self.layer_idx] = (ckv, k_pe)
+ 
+         if self.rope is not None:
++            assert not external_shared_kv, \
++                "ML4 shared-KV RoPE layer not supported by cache alias path"
+             q_pe, k_pe = self.rope.apply(
+                 q_pe, k_pe, position, positions, position_ids, True,
+                 None, None, self.norm_eps, 0.0, inv_freq,
+@@ -807,7 +1047,8 @@ class MLAttention(Module):
+             q_lat = mla_absorb(q.view(R, H, self.qk_head_dim), self.w_uk_flat, H, self.qk_nope_head_dim)
+             q_pe_hm = q_pe.reshape(R, H, self.qk_rope_head_dim).permute(1, 0, 2).contiguous()
+ 
+-        append(ckv, k_pe)
++        if not external_shared_kv:
++            append(ckv, k_pe)
+ 
+         # Full-indexer layers compute this chunk's indexer keys unconditionally: on the cached
+         # path they must land in the paged plane even while the context is still dense, so the
+@@ -946,25 +1187,39 @@ class MLAttention(Module):
+         layer = cache if not hasattr(cache, "layers") else \
+             cache.layers[self.layer_idx, params.get("layer_instance") or 0]
+ 
++        kv_layer = layer
++        if self.is_kv_shared_layer:
++            assert hasattr(cache, "layers"), \
++                "ML4 shared-KV requires a multi-layer cache"
++            kv_layer = cache.layers[
++                self.kv_source_layer,
++                params.get("layer_instance") or 0,
++            ]
++
+         # Graph-captured C++ path for the whole decode block (projections through o_proj as one
+         # replayed CUDA graph). Falls back to the dispatch path for unsupported configurations,
+         # including per-step declines (missing shared selection)
+         if (
+-            seqlen <= MAX_DECODE_QLEN and bsz <= _bc_max_bsz and
+-            params.get("causal", True) and params.get("inv_freq") is None
++            not self.learned_ssmax
++            and seqlen <= MAX_DECODE_QLEN
++            and bsz <= _bc_max_bsz
++            and params.get("causal", True)
++            and params.get("inv_freq") is None
+         ):
+             y = self.bc_mla_step(x, params, layer, block_table, cache_seqlens)
+             if y is not None:
+                 return y
+ 
+         from ..cache import CacheLayer_MLA_quant
+-        if isinstance(layer, CacheLayer_MLA_quant):
++        if isinstance(kv_layer, CacheLayer_MLA_quant):
+             # Packed latent feeds the kernels directly (online dequant, rotated domain); the rope
+             # key pages are fp16 either way
+-            ckv_cache, sk, kpe_cache, bits = layer.get_qc()
++            ckv_cache, sk, kpe_cache, bits = kv_layer.get_qc()
+             qc = (sk, bits)
+         else:
+-            ckv_cache, kpe_cache = layer.get_kv(cache_seqlens, block_table)
++            ckv_cache, kpe_cache = kv_layer.get_kv(
++                cache_seqlens, block_table
++            )
+             qc = None
+ 
+         # Host-side lengths for the tiled prefill and the sparse-DSA decision, shared across
+@@ -974,14 +1229,40 @@ class MLAttention(Module):
+         else:
+             host_seqlens = None
+ 
+-        return self._attend(
+-            x, bsz, seqlen, params, ckv_cache, kpe_cache, block_table, cache_seqlens,
+-            append = lambda ckv, k_pe:
+-                layer.update_kv_direct(cache_seqlens, block_table, ckv, k_pe, seqlen),
+-            qc = qc,
+-            host_seqlens = host_seqlens,
+-            idx_layer = layer if self.idx_plane_dim else None,
+-        )
++        old_shared = params.get("_ml4_external_shared_kv")
++
++        if self.is_kv_shared_layer:
++            params["_ml4_external_shared_kv"] = True
++
++        try:
++            return self._attend(
++                x, bsz, seqlen, params,
++                ckv_cache, kpe_cache,
++                block_table, cache_seqlens,
++                append = (
++                    (lambda ckv, k_pe: None)
++                    if self.is_kv_shared_layer
++                    else (
++                        lambda ckv, k_pe:
++                        layer.update_kv_direct(
++                            cache_seqlens,
++                            block_table,
++                            ckv,
++                            k_pe,
++                            seqlen,
++                        )
++                    )
++                ),
++                qc = qc,
++                host_seqlens = host_seqlens,
++                idx_layer = layer if self.idx_plane_dim else None,
++            )
++        finally:
++            if self.is_kv_shared_layer:
++                if old_shared is None:
++                    params.pop("_ml4_external_shared_kv", None)
++                else:
++                    params["_ml4_external_shared_kv"] = old_shared
+ 
+ 
+     def bc_mla_step(self, x, params, layer, block_table, cache_seqlens):

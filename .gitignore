@@ -57,3 +57,14 @@ refs/mia-glm53/
 
 # Local reference repositories
 refs/mia-glm53/
+
+# Mistral Large 4 / Le Chonk generated artifacts
+Mistral-Large-4-K2-PoC/
+**/weights/
+**/attention-k4/
+**/dense0-k4/
+**/k2-layer*-4096/
+**/Mistral-Large-4-EXL3-K2K4/
+*.safetensors
+*.gguf
+*.bin
