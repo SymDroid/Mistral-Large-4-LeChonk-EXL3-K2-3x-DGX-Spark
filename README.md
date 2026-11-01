@@ -1,351 +1,338 @@
-Mistral Large 3 675B EXL3 K2 on 2× DGX Spark
+Mistral Large 4 LeChonk EXL3 K2/K4 on 3× DGX Spark
 
+Experimental community project by SymDroid for preparing and running Mistral Large 4 1T-A52B on NVIDIA DGX Spark systems using a mixed EXL3 quantization layout and explicit pipeline parallelism.
 
+«Current status: the Mistral Large 4 text model has been successfully converted, assembled and structurally validated with ExLlamaV3. The 3-node pipeline runtime is the next implementation stage.»
 
+This project is nicknamed LeChonk.
 
+Current validated build
 
+The current text-only assembly has been validated with the following properties:
 
-Community deployment recipe by SymDroid for running Mistral Large 3 675B across two NVIDIA DGX Spark systems using EXL3 K2, a custom two-node pipeline runtime, and an OpenAI-compatible API.
+Component| Representation
+Routed MoE experts, layers 1–71| EXL3 K2
+Shared experts, layers 1–71| EXL3 K2
+Attention, layers 0–71| EXL3 K4
+Dense MLP, layer 0| EXL3 K4
+Routers| BF16
+Layer norms| BF16
+Token embeddings| BF16
+LM head| BF16
+LeRoPE alpha| BF16
 
-Unlike the companion Mistral Medium 3.5 recipe, this deployment does not use vLLM tensor parallelism. Flash K2 explicitly splits the model across two DGX Spark nodes and transfers hidden states between them.
+Final assembled text-model size:
 
-Tested configuration
+252.441 GiB
 
-2× DGX Spark
+Assembly validation:
 
-256 GB unified memory total
-
-Mistral Large 3 675B Instruct
-
-NVIDIA GB10 / ARM64
-
-CUDA 13.2
-
-PyTorch + ExLlamaV3
-
-EXL3 K2 routed experts
-
-FP8/BF16 non-expert components
-
-explicit two-stage pipeline execution
-
-direct ConnectX / QSFP link
-
-OpenAI-compatible API
-
-streaming SSE responses
-
-official Mistral tokenizer through mistral_common
-
-native Mistral tool calling
-
-multiple tool calls per assistant turn
-
-tested end-to-end with Onyx
-
-Observed on the reference setup:
-
-Metric
-
-Result
-
-Total unified memory
-
-256 GB
-
-Direct pipeline decode
-
-~4.9 tok/s
-
-OpenAI API sustained decode
-
-~3.9–4.0 tok/s
-
-TTFT, 4,249-token prompt
-
-~20.5 s
-
-TTFT, 5,431-token prompt
-
-~23.8 s
-
-Stage B prefill on larger prompts
-
-~9–11 s
-
-Current concurrency
-
-C1
-
-API port
-
-8018
-
-These are measurements from one setup, not guaranteed performance figures.
-
-Topology
-
-DGX Sparkx / Stage A
-192.168.100.11
-Embedding + layers 0..31
-        |
-        | hidden-state transfer
-        | direct high-speed link
-        v
-192.168.100.10
-DGX Spark / Stage B
-Layers 32..60 + final norm/head
-        |
-        | token
-        v
-DGX Sparkx / Stage A
-OpenAI API :8018
-
-Flash K2 deliberately avoids conventional cross-node tensor parallelism and NCCL collectives for model execution. Each node owns a contiguous portion of the transformer.
+- 9,235 safetensors files
+- 83,917 tensor keys
+- 0 duplicate tensor keys
+- essential-key audit passed
+- all 72 attention layers validated
+- ExLlamaV3 model constructor passed
 
 Model architecture
 
-Reference model: Mistral Large 3 675B Instruct
+Reference model:
 
-Approximate architecture:
+Mistral Large 4 1T-A52B
 
-675B total parameters
+Relevant text architecture:
 
-~41B active parameters
+- approximately 1.06T total source parameters
+- 72 transformer layers
+- hidden size 6144
+- 128 routed experts
+- top-4 expert routing
+- 1 shared expert
+- layer 0 dense
+- layers 1–71 MoE
+- MLA attention
+- latent KV rank 512
+- 32 index heads
+- configurable context up to 1,048,576 tokens in the source configuration
 
-61 transformer layers
+Mistral Large 4 uses a substantially different attention architecture from Mistral Large 3. The LeChonk runtime therefore includes Mistral 4-specific ExLlamaV3 work for MLA, shared KV sources, learned SSMax and LeRoPE.
 
-hidden size 7168
+Quantization layout
 
-128 routed experts
+MoE core
 
-top-4 expert routing
+The 71 sparse MoE layers use EXL3 K2 for the routed and shared expert matrices.
 
-one shared expert
+Measured output:
 
-first three layers dense
+- routed experts: approximately 240.260 GiB
+- shared experts: approximately 1.877 GiB
+- total MoE EXL3 core: approximately 242.1 GiB
 
-58 MoE layers
+Each expert retains separate EXL3 representations for:
 
-The routed expert population accounts for the overwhelming majority of model parameters.
+- "gate_proj"
+- "up_proj"
+- "down_proj"
 
-EXL3 K2 layout
+Attention
 
-Flash K2 uses a mixed representation:
+All 72 attention layers are converted to EXL3 K4 where applicable.
 
-Routed MoE experts              -> EXL3 K2
-Attention/shared/dense tensors  -> FP8 / BF16
-Routers/norms/sensitive tensors -> BF16
+Measured attention output:
 
-The routed experts alone represent roughly 654B parameters. Compressing that population to K2 is what makes this deployment practical across the combined 256 GB unified memory of two DGX Spark systems.
+5.4 GiB
 
-Pipeline split
+The converter handles the different Mistral Large 4 attention layouts, including:
 
-The model is divided into two explicit stages:
+- full indexer + local KV
+- shared indexer + local KV
+- full indexer + shared KV
 
-Stage A
-Embedding
-Layers 0..31
-Internal modules [0:33]
+All 72 layers passed exact key validation.
 
+Dense layer 0
+
+Mistral Large 4 uses one dense transformer MLP before the MoE stack.
+
+Layer 0 is converted to EXL3 K4:
+
+- "gate_proj"
+- "up_proj"
+- "down_proj"
+
+Measured size:
+
+216.18 MiB
+
+FP8 source conversion
+
+The upstream checkpoint uses block-scaled FP8 weights.
+
+LeChonk performs direct 128×128 block dequantization before EXL3 conversion:
+
+w = wf8.float().reshape(r // 128, 128, c // 128, 128)
+w.mul_(scale[:, None, :, None])
+w = w.reshape(r, c)
+
+No additional "/128" correction is applied.
+
+Mistral Large 4 ExLlamaV3 support
+
+The repository includes a patch for the Mistral Large 4 text architecture:
+
+tools/ml4/patches/exllamav3-mistral-large4.patch
+
+The patch adds or extends support for:
+
+- "MistralLarge4ForConditionalGeneration"
+- "mistral_large4_text"
+- Mistral 4 MLA attention
+- direct-hidden DSA indexer
+- learned SSMax
+- shared KV source layers
+- conditional RoPE / no-RoPE layers
+- LeRoPE alpha scaling
+- Mistral Large 4 key layouts
+- serialization of learned SSMax state
+
+LeRoPE uses the checkpoint tensor:
+
+lerope.alpha
+
+and applies:
+
+scaled_inv_freq = inv_freq * exp(alpha)
+
+The implementation also avoids applying the older Llama-4 beta scaling on top of learned SSMax.
+
+Build tools
+
+The Mistral Large 4 conversion tools are under:
+
+tools/ml4/
+
+Attention conversion
+
+ml4_attention_convert.py
+
+Converts one Mistral Large 4 attention layer to the mixed EXL3 K4/raw representation.
+
+Streaming attention runner
+
+ml4_attention_run.py
+
+Processes all 72 layers, validates each output and removes large source shards only after every dependent layer has passed validation.
+
+Final result:
+
+ALL 72 ATTENTION LAYERS VALID
+Pinned shard 53 retained: True
+
+Dense layer 0
+
+ml4_dense0_convert.py
+
+Converts the dense layer-0 MLP to EXL3 K4.
+
+Final assembly
+
+ml4_assemble_final.py
+
+Builds the final flat ExLlamaV3 model directory.
+
+Large quantized files are assembled with hardlinks so the approximately 248 GiB K2/K4 payload does not need to be duplicated on disk.
+
+The assembler also:
+
+- canonicalizes raw tensor names
+- preserves "lerope.alpha"
+- validates required tensors
+- checks global tensor-key uniqueness
+- keeps the original pinned source shard until runtime validation is complete
+
+Validated ExLlamaV3 model construction
+
+The assembled model successfully initializes as:
+
+architecture: MistralLarge4ForConditionalGeneration
+new_key_style: False
+layers: 72
+hidden: 6144
+experts: 128
+first dense layers: 1
+index heads: 32
+kv rank: 512
+
+MODEL CONSTRUCTOR OK
+modules: 75
+first block: 1
+last kv module: 72
+
+For the current text-only validation, the Pixtral vision/preprocessor initialization is intentionally bypassed.
+
+Target deployment: 3× DGX Spark
+
+The intended LeChonk runtime uses pipeline parallelism, not conventional cross-node tensor parallelism.
+
+Target topology:
+
+DGX Spark / symChonk-a
+Embedding + early transformer layers
         |
-        | FP32 hidden state
+        | hidden-state transfer
         v
-
-Stage B
-Layers 32..60
-Final norm
-LM head
-Internal modules [33:64]
-
-The hidden size is 7168, so the pipeline transfers 28,672 bytes per token when using FP32 hidden-state transfer.
-
-Inference stack
-
-Onyx / OpenAI client
+DGX Spark / symChonk-b
+Middle transformer layers
         |
+        | hidden-state transfer
         v
-FastAPI
-        |
-        v
-flash_k2_server.py
-        |
-        v
-PyTorch
-        |
-        v
-ExLlamaV3 + Flash K2 patches
-        |
-        v
-CUDA
-        |
-        v
-2× NVIDIA DGX Spark
+DGX Spark / symChonk-c
+Late transformer layers + final norm + LM head
 
-This is not a vLLM runtime.
+The exact layer boundaries will be selected according to measured resident bytes rather than simply splitting 72 layers into equal thirds.
 
-ExLlamaV3
+The goal is to leave sufficient memory on each node for:
 
-ExLlamaV3 is included as a pinned Git submodule under:
+- CUDA/runtime allocations
+- activations
+- MoE working buffers
+- MLA/DSA state
+- KV cache
+- API/runtime overhead
 
-refs/exllamav3
+Why three DGX Sparks?
 
-Pinned upstream commit:
+The validated text weights alone occupy:
 
-02aef45cd681b960a00afcd0749a4ab99e6c1bfe
+252.441 GiB
 
-Flash K2-specific changes are maintained separately:
+Two DGX Sparks provide 256 GB total unified memory, leaving essentially no practical runtime headroom.
 
-patches/exllamav3/flash-k2.patch
+Three DGX Sparks provide substantially more room for pipeline execution and KV cache while retaining the aggressive K2 expert representation.
 
-The patch contains DGX Spark / ARM64 compatibility work and EXL3 runtime fixes required for the Mistral MoE checkpoint, including correct EXL3 weight_scale handling.
+A two-Spark short-context experiment may still be investigated, but it is not the primary deployment target for this repository.
 
-1. Clone the repository
+Current project status
 
-git clone --recurse-submodules <repository-url>
-cd Mistral-Large-3-EXL3-K2-2x-DGX-Spark
+Completed:
 
-If cloned without submodules:
+- Mistral Large 4 checkpoint inspection
+- FP8 block dequantization
+- 71-layer MoE EXL3 K2 conversion
+- shared-expert conversion
+- 72-layer attention EXL3 K4 conversion
+- dense layer-0 EXL3 K4 conversion
+- Mistral Large 4 ExLlamaV3 architecture patch
+- learned SSMax support
+- LeRoPE support
+- shared-KV architecture support
+- final 252.441 GiB assembly
+- global key validation
+- ExLlamaV3 model-constructor smoke test
 
-git submodule update --init --recursive
+In progress:
 
-Apply the Flash K2 ExLlamaV3 patch:
+- 3-node pipeline placement
+- "symChonk-a"
+- "symChonk-b"
+- "symChonk-c"
+- pipeline transport
+- full runtime loading
+- KV-cache validation
+- generation smoke test
+- OpenAI-compatible serving layer
+- performance measurements
 
-cd refs/exllamav3
-git apply ../../patches/exllamav3/flash-k2.patch
-cd ../..
-
-2. Model weights
-
-Model weights are intentionally not included in this repository.
-
-The reference deployment mounts the prepared checkpoint at:
-
-/models/symistral
-
-Stage A contains the first portion of the model. Stage B only requires the tensors used by its portion of the pipeline.
-
-3. Start Stage B
-
-Stage B must be available before Stage A starts serving requests.
-
-export PYTHONPATH=/workspace/mistral-large-3-flash/refs/exllamav3
-python scripts/flash_k2_server.py --stage B
-
-The reference Stage B worker listens on:
-
-0.0.0.0:35137
-
-4. Start Stage A
-
-export PYTHONPATH=/workspace/mistral-large-3-flash/refs/exllamav3
-python scripts/flash_k2_server.py --stage A
-
-The OpenAI-compatible API is then available on port:
-
-8018
-
-5. Check the API
-
-Available endpoints:
-
-GET  /health
-GET  /v1/models
-POST /v1/chat/completions
-
-The served model name is:
-
-symistral
-
-Example:
-
-curl http://localhost:8018/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "symistral",
-    "messages": [
-      {
-        "role": "user",
-        "content": "Explain why the sky is blue in three sentences."
-      }
-    ],
-    "max_tokens": 128
-  }'
-
-Native Mistral tool calling
-
-Flash K2 uses the official Mistral tokenizer and translates Mistral's native tool-call representation to the OpenAI tool-calling schema.
-
-The current API supports:
-
-OpenAI tools
-
-tool_choice
-
-assistant tool_calls
-
-tool-result messages
-
-streaming delta.tool_calls
-
-multiple tool calls in one assistant turn
-
-Native tool execution has been tested end-to-end with Onyx, including multi-tool assistant turns.
-
-Why a custom pipeline?
-
-Mistral Large 3 is a sparse MoE model with a very large routed-expert population. Even though only a fraction of the parameters are active for each token, the expert weights still need to reside somewhere.
-
-Flash K2 combines aggressive expert quantization with an explicit layer split. Instead of presenting both DGX Sparks as one tensor-parallel model, Stage A computes the first part of the transformer and sends the resulting hidden state to Stage B.
-
-Stage B completes the forward pass and returns the sampled token.
-
-This also provides a path around cross-node tensor-parallel/NCCL constraints that can appear on experimental DGX Spark software stacks.
-
-Concurrency
-
-The v0.1 server currently uses a shared generation cache and a generation lock.
-
-Current concurrency:
-
-C1
-
-Future work includes independent request caches, batching, higher concurrency, prefix caching and further decode optimization.
+No generation-speed figures are published yet because the complete 3-node runtime has not yet been validated.
 
 Repository structure
 
-analysis/          tensor inspection and memory analysis
-golden/            known-good components and debug references
-patches/           external dependency patches
-quant/             K2 quantization and validation tooling
-refs/              upstream source dependencies
-runtime-stage/     runtime model metadata
-scripts/           assembly, validation, pipeline and API server
-upstream-meta/     source-model metadata
-upstream-runtime/  tokenizer/runtime metadata
+tools/ml4/
+    ml4_attention_convert.py
+    ml4_attention_run.py
+    ml4_dense0_convert.py
+    ml4_assemble_final.py
+    patches/
+        exllamav3-mistral-large4.patch
 
-Large generated checkpoints, model weights, quantization output and CUDA build artifacts are excluded from Git.
+refs/exllamav3/
+    pinned ExLlamaV3 source tree
 
-Notes
+quant/
+    earlier quantization and reference work
 
-The current release is an experimental reference implementation rather than a turnkey production inference server.
+analysis/
+    model inspection and experimental analysis
 
-The normal startup order is:
+scripts/
+    runtime and deployment utilities
 
-start Stage B
+Large model weights, generated checkpoints and quantization output are intentionally excluded from Git.
 
-wait for Stage B to finish loading
+Hardware
 
-start Stage A
+Development and conversion have been performed on NVIDIA DGX Spark / GB10 ARM64 systems.
 
-wait for the OpenAI API to become available
+The target runtime is:
 
-connect Onyx or another OpenAI-compatible client
+3× NVIDIA DGX Spark
+384 GB combined unified memory
+direct high-speed interconnect
+pipeline-parallel execution
 
-The current implementation prioritizes making Mistral Large 3 run correctly across two DGX Sparks. Performance, concurrency and deployment ergonomics can be improved further.
+Experimental status
+
+LeChonk is currently an experimental reference implementation.
+
+The model conversion and structural assembly are validated, but the complete three-node inference runtime is still under active development.
+
+Do not interpret the current repository as a finished turnkey inference server.
 
 Disclaimer
 
-This is an independent community project and is not affiliated with or endorsed by Mistral AI, NVIDIA, ExLlamaV3 or Onyx.
+This is an independent community project by SymDroid.
+
+It is not affiliated with or endorsed by Mistral AI, NVIDIA, ExLlamaV3, Hugging Face or Onyx.
 
 Model licensing and third-party components remain subject to their respective upstream licenses.
